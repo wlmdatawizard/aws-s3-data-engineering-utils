@@ -13,6 +13,7 @@ import pandas as pd
 import time
 import os
 
+
 s3 = boto3.client("s3")
 glue = boto3.client('glue')
 athena = boto3.client('athena')
@@ -22,6 +23,8 @@ run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 latest_key = "raw/monsters/latest/monsters.csv"
 run_key = f"raw/monsters/runs/run_id={run_id}/monsters.csv"
 file = r"C:\Users\willi\OneDrive\Desktop\aws_project\aws-s3-data-engineering-utils\data\monster\MonsterForge_monsters_raw_100.csv"
+athena_database = "monsterforge_data_lake"
+athena_output = f"s3://{bucket_name}/athena-results/"
 
 
 def run_safely(func, *args, default_return=None, error_message="Operation failed", **kwargs):
@@ -294,7 +297,98 @@ def run_glue_crawlers():
     print("✓ Glue crawlers completed")
 
 
+def run_athena_validation():
+    print("\n========== ATHENA VALIDATION ==========")
+
+    query = """
+    SELECT
+        COUNT(*) AS clean_rows,
+        COUNT(DISTINCT monster_type) AS monster_types,
+        COUNT(DISTINCT status) AS statuses,
+        ROUND(AVG(base_price), 2) AS average_price
+    FROM "table";
+    """
+
+    response = run_safely(athena.start_query_execution, QueryString=query, QueryExecutionContext={"Database": athena_database},
+                          ResultConfiguration={"OutputLocation": athena_output}, error_message="Failed to start Athena query")
+
+    if response is None:
+        return
+
+    query_execution_id = response["QueryExecutionId"]
+
+    print("Status:")
+
+    previous_state = None
+
+    while True:
+
+        response = run_safely(athena.get_query_execution, QueryExecutionId=query_execution_id, error_message="Failed to get Athena query status")
+
+        if response is None:
+            return
+
+        state = response["QueryExecution"]["Status"]["State"]
+
+        if state != previous_state:
+            print(state)
+            previous_state = state
+
+        if state == "SUCCEEDED":
+            break
+
+        if state in ["FAILED", "CANCELLED"]:
+            reason = response["QueryExecution"]["Status"].get("StateChangeReason", "Unknown")
+            print(reason)
+            return
+
+        time.sleep(2)
+
+    response = run_safely(athena.get_query_results, QueryExecutionId=query_execution_id, error_message="Failed to retrieve Athena results")
+
+    if response is None:
+        return
+
+    rows = response["ResultSet"]["Rows"]
+
+    headers = [
+        col["VarCharValue"]
+        for col in rows[0]["Data"]
+    ]
+
+    values = [
+        col.get("VarCharValue", "")
+        for col in rows[1]["Data"]
+    ]
+
+    print("\nValidation Results")
+    print("--------------------------------")
+
+    for header, value in zip(headers, values):
+        print(f"{header:<18} {value}")
+
+    print("\n✓ Athena validation completed")
+
+
+def pipeline_complete(clean_df, quarantine_df, run_id):
+    print("\n========== PIPELINE COMPLETE ==========")
+
+    print(f"Run ID: {run_id}")
+    print("--------------------------------")
+
+    print(f"{'Clean Rows':<22} {clean_df.count()}")
+    print(f"{'Quarantine Rows':<22} {quarantine_df.count()}")
+    print(f"{'S3 Upload':<22} SUCCESS")
+    print(f"{'Athena Validation':<22} SUCCESS")
+
+    print("--------------------------------")
+    print("✓ MonsterForge ETL pipeline completed successfully")
+    return
+
+
 clean_df, quarantine_df = transform_data(df)
 clean_local_file, quarantine_local_file = export_to_local(clean_df, quarantine_df, run_id)
 export_to_s3(clean_local_file, quarantine_local_file, run_id)
-# run_glue_crawlers()
+run_glue_crawlers()
+run_athena_validation()
+pipeline_complete(clean_df, quarantine_df, run_id)
